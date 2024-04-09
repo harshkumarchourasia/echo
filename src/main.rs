@@ -1,70 +1,90 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::fmt;
+use std::io::{StdoutLock, Write};
 
-#[derive(Serialize, Deserialize)]
-struct Body {
-    #[serde(rename = "type")]
-    ty: String,
-    msg_id: Option<i32>,
-    in_reply_to: Option<i32>,
-    echo: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct Message {
     src: String,
-    dest: String,
+    #[serde(rename = "dest")]
+    dst: String,
     body: Body,
 }
 
-impl fmt::Debug for Body {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Write the "type" field
-        write!(f, "{{ \"type\": \"{}\"", self.ty)?;
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct Body {
+    #[serde(rename = "msg_id")]
+    id: Option<usize>,
+    in_reply_to: Option<usize>,
+    #[serde(flatten)]
+    payload: Payload,
+}
 
-        if let Some(msg_id) = self.msg_id {
-            write!(f, ", \"msg_id\": {}", msg_id)?;
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum Payload {
+    Echo { echo: String },
+    EchoOk { echo: String },
+    Init  { node_id: String, node_ids: Vec<String> },
+    InitOk
+}
+
+struct EchoNode;
+
+impl EchoNode {
+    pub fn step(
+        &mut self,
+        input: Message,
+        output: &mut  StdoutLock,
+    ) -> anyhow::Result<()> {
+        match input.body.payload {
+            Payload::Echo { echo } => {
+                let reply = Message {
+                    src: input.dst,
+                    dst: input.src,
+                    body: Body {
+                        id: input.body.id,
+                        in_reply_to: input.body.id,
+                        payload: Payload::EchoOk { echo },
+                    },
+                };
+                serde_json::to_writer(&mut *output, &reply)?;
+                output.write_all(b"\n").context("writing trailing new line")
+            }
+            Payload::EchoOk { .. } => Ok(()),
+            Payload::InitOk { .. } => Ok(()),
+            Payload::Init { .. } => {
+                let reply = Message{
+                    src: input.dst,
+                    dst: input.src,
+                    body: Body {
+                        id: input.body.id,
+                        in_reply_to: input.body.id,
+                        payload: Payload::InitOk,
+                    }
+                };
+                serde_json::to_writer(&mut *output, &reply)?;
+                output.write_all(b"\n").context("writing trailing new line")
+            }
         }
-
-        if let Some(in_reply_to) = self.in_reply_to {
-            write!(f, ", \"in_reply_to\": {}", in_reply_to)?;
-        }
-
-        if let Some(ref echo) = self.echo {
-            write!(f, ", \"echo\": \"{}\"", echo)?;
-        }
-
-        write!(f, "}}")
     }
 }
 
-impl fmt::Debug for Message {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{{\"src\": \"{}\", \"dest\": \"{}\" , \"body\": {:?}}}",
-            self.src, self.dest, self.body
-        )
+fn main() -> anyhow::Result<()> {
+    let stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message>();
+
+    let mut state = EchoNode;
+    for input in inputs {
+        let input: Message =
+            input.context("Maelstrom input from STDIN can not be deserialized ")?;
+        state
+            .step(input, &mut stdout)
+            .context("Node Step function failed")?;
+        stdout.flush()?;
     }
-}
 
-fn echo(mut inp: Message) -> Message {
-    inp.body.ty = "echo_ok".to_string();
-    inp.body.in_reply_to = inp.body.msg_id;
-    inp
-}
-
-fn main() {
-    loop {
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read line");
-
-        let message: Message = serde_json::from_str(&input).expect("Failed to parse JSON");
-        let response = echo(message);
-
-        println!("{:?}", response);
-    }
+    Ok(())
 }
